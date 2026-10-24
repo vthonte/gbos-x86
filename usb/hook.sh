@@ -192,8 +192,19 @@ if [ -f $G/bootdisk.img ]; then
     ln -sf /dev/block/loop6p$i /dev/block/by-name/$n
     i=$((i+1))
   done
+  for b in boot_a boot_b vendor_boot_a vendor_boot_b init_boot_a init_boot_b; do
+    ln -sf /dev/block/loop6p1 /dev/block/by-name/$b
+  done
   log "hook: bootdisk on loop6: $(ls /sys/class/block | grep loop6p | tr '\n' ' ')"
 fi
+
+# Mask SetupWizard APK directories so Android skips initial setup and launches Desktop directly
+mkdir -p /tmp/empty_suw
+for suw_dir in /new/product/priv-app/*SetupWizard* /new/system_ext/priv-app/*SetupWizard* /new/product/priv-app/*setupwizard* /new/system_ext/priv-app/*setupwizard*; do
+  if [ -d "$suw_dir" ]; then
+    mount --bind /tmp/empty_suw "$suw_dir" && log "hook: masked $suw_dir with empty dir"
+  fi
+done
 
 # Fake crossystem (no ChromeOS firmware on this laptop)
 [ -f $G/crossystem ] && mount --bind $G/crossystem /new/vendor/bin/crossystem && log "hook: crossystem faked"
@@ -216,6 +227,9 @@ gbos_touchpads() {
 if mount --bind /gbos /new/postinstall; then
   mkdir -p /tmp/sysinit && cp -a /new/system/etc/init/. /tmp/sysinit/
   rm -f /tmp/sysinit/gscd.rc   # gscd needs Google's security chip (/dev/tpm0); it only crash-loops here
+  rm -f /tmp/sysinit/timberslide.rc # timberslide needs ChromeOS EC (/dev/cros_ec); crash-loops on generic PCs
+  rm -f /tmp/sysinit/udsattestation.rc # udsattestation needs Titan C security chip; loops on generic PCs
+  rm -f /tmp/sysinit/mmd.rc            # disable mmd & 24GB zram/8GB disk swap on pendrive
   # RESOLUTION in gbos.cfg: logical display size (e.g. 2400x1350) that SurfaceFlinger renders at and the
   # display hardware scales to the 1920x1080 panel, so everything looks smaller with stock density.
   case "$RESOLUTION" in [0-9]*x[0-9]*) WMSIZE=$RESOLUTION;; *) WMSIZE=reset;; esac
@@ -244,7 +258,8 @@ if mount --bind /gbos /new/postinstall; then
 # Rotate at 1 MB: on this stick, data written past ~4 MB of a file that stays open never reaches
 # the FAT cluster chain before power-off (fsck: "size ... should at most be 4046848"). Rotating
 # closes each file; logcat.txt is newest, then logcat.txt.1, .2, ...
-service gbos_logcat /system/bin/logcat -b all -v threadtime -r 1024 -n 99 -f /postinstall/gbos/logs/boot-$N/logcat.txt
+# Rotate at 1 MB, keep last 10 files to reduce USB flash drive write wear and I/O latency
+service gbos_logcat /system/bin/logcat -b all -v threadtime -r 1024 -n 10 -f /postinstall/gbos/logs/boot-$N/logcat.txt
     user root
     group root log
     seclabel u:r:shell:s0
@@ -256,7 +271,8 @@ service gbos_crashlog /system/bin/logcat -b crash -v threadtime -f /postinstall/
     seclabel u:r:shell:s0
 
 # The laptop is usually powered off by hand, so flush the logs to the stick every 5 s.
-service gbos_sync /system/bin/sh -c "while true; do sleep 5; sync; done"
+# Also executes /postinstall/gbos/run.sh as root backchannel if present.
+service gbos_sync /system/bin/sh -c "while true; do sleep 5; if [ -f /postinstall/gbos/run.sh ]; then sh /postinstall/gbos/run.sh > /postinstall/gbos/run.log 2>&1; rm -f /postinstall/gbos/run.sh; fi; sync; done"
     user root
     group root
     seclabel u:r:shell:s0
@@ -289,6 +305,8 @@ on property:sys.boot_completed=1
     # The KVM exit trace (kvmtrace.txt) only matters while the Trusty VM boots; left on it costs CPU and writes a lot.
     write /sys/kernel/tracing/tracing_on 0
     $TRUSTYSTOP
+    start gbos_skip_setup
+    start gbos_optimize
     start gbos_audiodiag
     start gbos_devname
     start gbos_iptsd
@@ -296,6 +314,22 @@ on property:sys.boot_completed=1
     start gbos_displaydiag
     start gbos_aidiag
     start gbos_ksu
+
+# update_engine runs normally to satisfy GMS binder without crashing
+
+# Skip SetupWizard completely and launch desktop
+service gbos_skip_setup /system/bin/sh -c "sleep 1; settings put --user 0 secure user_setup_complete 1; settings put --user 10 secure user_setup_complete 1; settings put secure user_setup_complete 1; settings put global device_provisioned 1; settings put global setup_wizard_has_run 1; settings put global force_resizable_activities 1; settings put global enable_freeform_support 1; settings put global ota_disable_automatic_update 1; settings put global auto_system_update 0; setprop ro.setupwizard.mode DISABLED; am start --user 10 -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null; am start -n com.google.android.apps.nexuslauncher/.NexusLauncherActivity -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null"
+    user root
+    group root
+    seclabel u:r:shell:s0
+    oneshot
+
+# GBOS System, Gaming and RAM Optimization Service
+service gbos_optimize /system/bin/sh /postinstall/gbos/optimize.sh
+    user root
+    group root
+    seclabel u:r:shell:s0
+    oneshot
 
 # AI diagnostics (Magic Pointer / AICore): usb/aidiag.sh writes logs/boot-N/ai-1.txt (90 s) and ai-2.txt (4 min).
 # The gbos_aidns_* services run one ping per app uid so aidiag can compare DNS as AICore (10107) with
@@ -600,6 +634,9 @@ if [ -f $G/audio/gbos-hda-pch/audio_config.xml ]; then
 fi
 # apgetty (UART shell) has no UART configured here and crash-loops
 : > /tmp/empty.rc && mount --bind /tmp/empty.rc /new/system_ext/etc/init/apgetty.rc && log "hook: apgetty disabled"
+mount --bind /tmp/empty.rc /new/vendor/etc/init/hal_desktop_charge_control_default.rc 2>/dev/null && log "hook: charge_control disabled"
+mount --bind /tmp/empty.rc /new/vendor/etc/init/suspend_notification_service.rc 2>/dev/null && log "hook: suspend_notification disabled"
+mount --bind /tmp/empty.rc /new/vendor/etc/init/suspend_diagnostics.rc 2>/dev/null && log "hook: suspend_diagnostics disabled"
 log "hook: kvm: $(ls /sys/class/misc | grep -E 'kvm|vhost' | tr '\n' ' ')"
 
 # KVM trace -> kvmtrace.txt: guest exceptions / failed emulation / triple faults, to see why the
