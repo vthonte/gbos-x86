@@ -190,11 +190,33 @@ mdev -s
 
 [ "$SHELL_AT" = pre_android ] && shell "SHELL_AT=pre_android (Android root at /new)"
 
+find_part() {
+  _lbl="$1"
+  _dev=$(findfs LABEL="$_lbl" 2>/dev/null)
+  if [ -n "$_dev" ] && [ -b "$_dev" ]; then echo "$_dev"; return 0; fi
+  for _u in /sys/class/block/*/uevent; do
+    [ -f "$_u" ] || continue
+    _pname=$(sed -n 's/^PARTNAME=//p' "$_u" 2>/dev/null)
+    _dname=$(sed -n 's/^DEVNAME=//p' "$_u" 2>/dev/null)
+    _maj=$(sed -n 's/^MAJOR=//p' "$_u" 2>/dev/null)
+    _min=$(sed -n 's/^MINOR=//p' "$_u" 2>/dev/null)
+    if [ -n "$_dname" ] && [ -n "$_maj" ] && [ -n "$_min" ]; then
+      [ -b "/dev/$_dname" ] || mknod -m 660 "/dev/$_dname" b "$_maj" "$_min" 2>/dev/null
+      if [ "$_pname" = "$_lbl" ]; then
+        echo "/dev/$_dname"
+        return 0
+      fi
+    fi
+  done
+  _dev=$(findfs LABEL="$_lbl" 2>/dev/null)
+  [ -n "$_dev" ] && echo "$_dev"
+}
+
 # /data and /metadata: the NVMe install's ext4 partitions (persistent), else tmpfs (fresh each boot).
 # ext4 is made without the encrypt feature, so vold behaves as it did on tmpfs (no fscrypt).
 DATA=; META=
 if [ $FROM = nvme ]; then
-  DATA=$(findfs LABEL=GBOS_DATA 2>/dev/null); META=$(findfs LABEL=GBOS_META 2>/dev/null)
+  DATA=$(find_part GBOS_DATA); META=$(find_part GBOS_META)
   # A dual-boot install (installer mode 1) has no GBOS_META partition: /metadata is the 64 MB ext4 image gbos/metadata.img inside GBOSSYS.
   # loop12 is free in both layouts (0-5 and 7 are super.img, 8-11 the separate images, 6 the fake boot disk).
   if [ -n "$DATA" ] && [ -z "$META" ] && [ -f $G/metadata.img ]; then
